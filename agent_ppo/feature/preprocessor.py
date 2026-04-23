@@ -1,37 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
-###########################################################################
-"""
-Author: Tencent AI Arena Authors
-
-Feature preprocessor and reward design for Gorge Chase PPO.
-峡谷追猎 PPO 特征预处理与奖励设计。
-"""
 
 import numpy as np
+from collections import deque
 
-# Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
-# Max monster speed / 最大怪物速度
-MAX_MONSTER_SPEED = 5.0
-# Max distance bucket / 距离桶最大值
-MAX_DIST_BUCKET = 5.0
-# Max flash cooldown / 最大闪现冷却步数
-MAX_FLASH_CD = 2000.0
-# Max buff duration / buff最大持续时间
-MAX_BUFF_DURATION = 50.0
-
 
 def _norm(v, v_max, v_min=0.0):
-    """Normalize value to [0, 1].
-
-    将值归一化到 [0, 1]。
-    """
     v = float(np.clip(v, v_min, v_max))
     return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
 
+def _ensure_list(data):
+    """解决开悟平台底层 C++ 数据序列化可能退化为字典的 Bug"""
+    if not data: return []
+    if isinstance(data, list): return data
+    if isinstance(data, dict):
+        if "pos" in data or "hero_id" in data: return [data]
+        return list(data.values())
+    return [data]
 
 class Preprocessor:
     def __init__(self):
@@ -39,112 +25,118 @@ class Preprocessor:
 
     def reset(self):
         self.step_no = 0
-        self.max_step = 200
-        self.last_min_monster_dist_norm = 0.5
+        self.max_step = 1000
+        self.last_treasure_count = 0 
+        self.last_nearest_t_dist = MAP_SIZE * 1.41
+        self.last_buff_time = 0
+        self.pos_history = deque(maxlen=11) # 追踪10步前位置，预判怪物2
 
     def feature_process(self, env_obs, last_action):
-        """Process env_obs into feature vector, legal_action mask, and reward.
+        observation = env_obs.get("observation", {})
+        frame_state = observation.get("frame_state", {})
+        env_info = observation.get("env_info", {})
+        legal_act_raw = observation.get("legal_action", [])
+        
+        self.step_no = observation.get("step_no", 0)
+        self.max_step = env_info.get("max_step", 1000)
 
-        将 env_obs 转换为特征向量、合法动作掩码和即时奖励。
-        """
-        observation = env_obs["observation"]
-        frame_state = observation["frame_state"]
-        env_info = observation["env_info"]
-        map_info = observation["map_info"]
-        legal_act_raw = observation["legal_action"]
+        heroes_list = _ensure_list(frame_state.get("heroes"))
+        hero = heroes_list[0] if heroes_list else {}
+        hero_pos = hero.get("pos", {"x": 0, "z": 0})
+        hx, hz = hero_pos.get("x", 0), hero_pos.get("z", 0)
+        self.pos_history.append((hx, hz))
 
-        self.step_no = observation["step_no"]
-        self.max_step = env_info.get("max_step", 200)
+        # 1. 怪物2背刺预判特征
+        if len(self.pos_history) == 11:
+            h10_x, h10_z = self.pos_history[0]
+            h10_dx_norm, h10_dz_norm = _norm(hx-h10_x, MAP_SIZE, -MAP_SIZE), _norm(hz-h10_z, MAP_SIZE, -MAP_SIZE)
+        else:
+            h10_dx_norm, h10_dz_norm = 0.5, 0.5
 
-        # Hero self features (4D) / 英雄自身特征
-        hero = frame_state["heroes"]
-        hero_pos = hero["pos"]
-        hero_x_norm = _norm(hero_pos["x"], MAP_SIZE)
-        hero_z_norm = _norm(hero_pos["z"], MAP_SIZE)
-        flash_cd_norm = _norm(hero["flash_cooldown"], MAX_FLASH_CD)
-        buff_remain_norm = _norm(hero["buff_remaining_time"], MAX_BUFF_DURATION)
+        # 2. 全局引力雷达（宝箱、怪物）
+        nearest_t_dist = MAP_SIZE * 1.41
+        t_dx_norm, t_dz_norm = 0.0, 0.0
+        organs_list = _ensure_list(frame_state.get("organs"))
+        for organ in organs_list:
+            if organ.get("status") == 1 and organ.get("sub_type") == 1:
+                ox, oz = organ.get("pos",{}).get("x",0), organ.get("pos",{}).get("z",0)
+                dist = np.sqrt((ox-hx)**2 + (oz-hz)**2)
+                if dist < nearest_t_dist:
+                    nearest_t_dist = dist
+                    t_dx_norm, t_dz_norm = np.clip((ox-hx)/MAP_SIZE, -1, 1), np.clip((oz-hz)/MAP_SIZE, -1, 1)
+                    
+        nearest_m_dist = MAP_SIZE * 1.41
+        m_dx_norm, m_dz_norm = 0.0, 0.0
+        monsters_list = _ensure_list(frame_state.get("monsters"))
+        for m in monsters_list:
+            mx, mz = m.get("pos",{}).get("x",0), m.get("pos",{}).get("z",0)
+            dist = np.sqrt((mx-hx)**2 + (mz-hz)**2)
+            if dist < nearest_m_dist:
+                nearest_m_dist = dist
+                m_dx_norm, m_dz_norm = np.clip((mx-hx)/MAP_SIZE, -1, 1), np.clip((mz-hz)/MAP_SIZE, -1, 1)
 
-        hero_feat = np.array([hero_x_norm, hero_z_norm, flash_cd_norm, buff_remain_norm], dtype=np.float32)
+        # 3. 向量特征组装
+        vector_feat = np.array([
+            _norm(hx, MAP_SIZE), _norm(hz, MAP_SIZE),
+            _norm(hero.get("flash_cooldown", 0), 2000.0),
+            _norm(hero.get("buff_remaining_time", 0), 50.0),
+            _norm(self.step_no, self.max_step), _norm(self.step_no, self.max_step),
+            t_dx_norm, t_dz_norm, m_dx_norm, m_dz_norm,
+            h10_dx_norm, h10_dz_norm
+        ], dtype=np.float32)
 
-        # Monster features (5D x 2) / 怪物特征
-        monsters = frame_state.get("monsters", [])
-        monster_feats = []
-        for i in range(2):
-            if i < len(monsters):
-                m = monsters[i]
-                is_in_view = float(m.get("is_in_view", 0))
-                m_pos = m["pos"]
-                if is_in_view:
-                    m_x_norm = _norm(m_pos["x"], MAP_SIZE)
-                    m_z_norm = _norm(m_pos["z"], MAP_SIZE)
-                    m_speed_norm = _norm(m.get("speed", 1), MAX_MONSTER_SPEED)
+        # 4. 视觉矩阵
+        spatial_tensor = np.zeros((4, 21, 21), dtype=np.float32)
+        map_info = observation.get("map_info", [])
+        if map_info and len(map_info) == 21: spatial_tensor[0] = np.array(map_info, dtype=np.float32)
+        for organ in organs_list:
+            if organ.get("status") == 1:
+                gx, gz = 10+(organ.get("pos",{}).get("x",0)-hx), 10+(organ.get("pos",{}).get("z",0)-hz)
+                if 0<=gx<21 and 0<=gz<21: spatial_tensor[1 if organ.get("sub_type")==1 else 2, int(gx), int(gz)] = 1.0
+        for m in monsters_list:
+            if m.get("is_in_view", 0):
+                gx, gz = np.clip(10+(m.get("pos",{}).get("x",0)-hx), 0, 20), np.clip(10+(m.get("pos",{}).get("z",0)-hz), 0, 20)
+                spatial_tensor[3, int(gx), int(gz)] = 1.0
 
-                    # Euclidean distance / 欧式距离
-                    raw_dist = np.sqrt((hero_pos["x"] - m_pos["x"]) ** 2 + (hero_pos["z"] - m_pos["z"]) ** 2)
-                    dist_norm = _norm(raw_dist, MAP_SIZE * 1.41)
-                else:
-                    m_x_norm = 0.0
-                    m_z_norm = 0.0
-                    m_speed_norm = 0.0
-                    dist_norm = 1.0
-                monster_feats.append(
-                    np.array([is_in_view, m_x_norm, m_z_norm, m_speed_norm, dist_norm], dtype=np.float32)
-                )
-            else:
-                monster_feats.append(np.zeros(5, dtype=np.float32))
+        feature = np.concatenate([spatial_tensor.flatten(), vector_feat])
 
-        # Local map features (16D) / 局部地图特征
-        map_feat = np.zeros(16, dtype=np.float32)
-        if map_info is not None and len(map_info) >= 13:
-            center = len(map_info) // 2
-            flat_idx = 0
-            for row in range(center - 2, center + 2):
-                for col in range(center - 2, center + 2):
-                    if 0 <= row < len(map_info) and 0 <= col < len(map_info[0]):
-                        map_feat[flat_idx] = float(map_info[row][col] != 0)
-                    flat_idx += 1
+        # 合法动作掩码 (16维)
+        legal_action = [1]*16
+        if isinstance(legal_act_raw, list) and len(legal_act_raw) >= 8:
+            legal_action = [int(x) for x in legal_act_raw][:16]
+            if len(legal_action) == 8: legal_action += [1]*8
 
-        # Legal action mask (8D) / 合法动作掩码
-        legal_action = [1] * 8
-        if isinstance(legal_act_raw, list) and legal_act_raw:
-            if isinstance(legal_act_raw[0], bool):
-                for j in range(min(8, len(legal_act_raw))):
-                    legal_action[j] = int(legal_act_raw[j])
-            else:
-                valid_set = {int(a) for a in legal_act_raw if int(a) < 8}
-                legal_action = [1 if j in valid_set else 0 for j in range(8)]
+        # ==========================================
+        # 5. 奖励函数：针对你的监控图进行“处方级”调优
+        # ==========================================
+        reward = 0.01 + (0.02 * (self.step_no / self.max_step))
+        
+        # 指数级恐惧：靠近怪物重罚，逼出闪现！
+        if nearest_m_dist < 5.0:
+            reward -= np.clip(1.5 * (1.0 / (nearest_m_dist + 0.1)**2), 0, 3.5)
+        elif nearest_m_dist < 8.0:
+            reward -= 0.1
 
-        if sum(legal_action) == 0:
-            legal_action = [1] * 8
+        # 宝箱引力：解决你图中“宝箱收集为0”
+        cur_treasure = hero.get("treasure_collected_count", 0)
+        if cur_treasure > self.last_treasure_count:
+            reward += 5.0  # 巨额即时奖励
+            self.last_treasure_count = cur_treasure
+        else:
+            if nearest_t_dist != MAP_SIZE * 1.41:
+                # 持续引力场奖励
+                reward += 0.4 * (1.0 / (nearest_t_dist / 10.0 + 1.0))
+                if nearest_t_dist < self.last_nearest_t_dist: reward += 0.1
 
-        # Progress features (2D) / 进度特征
-        step_norm = _norm(self.step_no, self.max_step)
-        survival_ratio = step_norm
-        progress_feat = np.array([step_norm, survival_ratio], dtype=np.float32)
+        # 怪物2出生杀防御
+        if 270 < self.step_no < 330 and len(self.pos_history) == 11:
+            dist_to_h10 = np.sqrt((hx-self.pos_history[0][0])**2 + (hz-self.pos_history[0][1])**2)
+            if dist_to_h10 < 7.0: reward -= 0.8
 
-        # Concatenate features / 拼接特征
-        feature = np.concatenate(
-            [
-                hero_feat,
-                monster_feats[0],
-                monster_feats[1],
-                map_feat,
-                np.array(legal_action, dtype=np.float32),
-                progress_feat,
-            ]
-        )
+        # 加速Buff拾取奖励（解决你图中加速Buff为0）
+        cur_buff_time = hero.get("buff_remaining_time", 0)
+        if cur_buff_time > 0 and self.last_buff_time == 0: reward += 1.5
+        self.last_buff_time = cur_buff_time
 
-        # Step reward / 即时奖励
-        cur_min_dist_norm = 1.0
-        for m_feat in monster_feats:
-            if m_feat[0] > 0:
-                cur_min_dist_norm = min(cur_min_dist_norm, m_feat[4])
-
-        survive_reward = 0.01
-        dist_shaping = 0.1 * (cur_min_dist_norm - self.last_min_monster_dist_norm)
-
-        self.last_min_monster_dist_norm = cur_min_dist_norm
-
-        reward = [survive_reward + dist_shaping]
-
-        return feature, legal_action, reward
+        self.last_nearest_t_dist = nearest_t_dist
+        return feature, legal_action, [reward]
