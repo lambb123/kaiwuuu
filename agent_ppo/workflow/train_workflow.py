@@ -128,10 +128,10 @@ class EpisodeRunner:
                     total_score = env_info.get("total_score", 0)
 
                     if terminated:
-                        final_reward[0] = -10.0
+                        final_reward[0] = -15.0 # 被怪物抓到，加大惩罚力度
                         result_str = "FAIL"
                     else:
-                        final_reward[0] = 10.0
+                        final_reward[0] = 30.0  # 成功存活到1000步（truncated），给与极大的正反馈
                         result_str = "WIN"
 
                     self.logger.info(
