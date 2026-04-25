@@ -11,7 +11,6 @@ def _norm(v, v_max, v_min=0.0):
     return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
 
 def _ensure_list(data):
-    """解决开悟平台底层 C++ 数据序列化可能退化为字典的 Bug"""
     if not data: return []
     if isinstance(data, list): return data
     if isinstance(data, dict):
@@ -48,13 +47,6 @@ class Preprocessor:
         hx, hz = hero_pos.get("x", 0), hero_pos.get("z", 0)
         self.pos_history.append((hx, hz))
 
-        # 【防撞墙检测】：判断当前坐标是否与上一步完全一致
-        is_stuck = False
-        if len(self.pos_history) >= 2:
-            last_hx, last_hz = self.pos_history[-2]
-            if hx == last_hx and hz == last_hz:
-                is_stuck = True
-
         # 1. 怪物2背刺预判特征
         if len(self.pos_history) == 11:
             h10_x, h10_z = self.pos_history[0]
@@ -62,7 +54,7 @@ class Preprocessor:
         else:
             h10_dx_norm, h10_dz_norm = 0.5, 0.5
 
-        # 2. 全局引力雷达（宝箱、Buff、怪物）
+        # 2. 全局引力雷达
         nearest_t_dist = MAP_SIZE * 1.41
         nearest_b_dist = MAP_SIZE * 1.41
         t_dx_norm, t_dz_norm = 0.0, 0.0
@@ -74,11 +66,11 @@ class Preprocessor:
                 ox, oz = organ.get("pos",{}).get("x",0), organ.get("pos",{}).get("z",0)
                 dist = np.sqrt((ox-hx)**2 + (oz-hz)**2)
                 
-                if sub_type == 1:  # 宝箱
+                if sub_type == 1:  
                     if dist < nearest_t_dist:
                         nearest_t_dist = dist
                         t_dx_norm, t_dz_norm = np.clip((ox-hx)/MAP_SIZE, -1, 1), np.clip((oz-hz)/MAP_SIZE, -1, 1)
-                elif sub_type == 2:  # 加速Buff
+                elif sub_type == 2:  
                     if dist < nearest_b_dist:
                         nearest_b_dist = dist
                     
@@ -92,10 +84,9 @@ class Preprocessor:
                 nearest_m_dist = dist
                 m_dx_norm, m_dz_norm = np.clip((mx-hx)/MAP_SIZE, -1, 1), np.clip((mz-hz)/MAP_SIZE, -1, 1)
 
-        # 闪现最大冷却可配置到2000，这里保持2000.0做归一化是安全的
         flash_cd = hero.get("flash_cooldown", 0)
 
-        # 3. 向量特征组装
+        # 3. 向量特征
         vector_feat = np.array([
             _norm(hx, MAP_SIZE), _norm(hz, MAP_SIZE),
             _norm(flash_cd, 2000.0),
@@ -120,7 +111,7 @@ class Preprocessor:
 
         feature = np.concatenate([spatial_tensor.flatten(), vector_feat])
 
-        # 合法动作掩码 (16维)：精确屏蔽闪现CD
+        # 精确屏蔽闪现CD
         legal_action = [1] * 16
         if isinstance(legal_act_raw, list):
             if len(legal_act_raw) >= 16:
@@ -131,53 +122,57 @@ class Preprocessor:
                     legal_action[8:16] = [0] * 8
 
         # ==========================================
-        # 5. 奖励函数：融合高端操作的精细化调优
+        # 5. 奖励函数：彻底打破局部最优，强制跑动与寻宝
         # ==========================================
-        # 基础生存奖励
-        reward = 0.015 
+        reward = 0.02  # 提高基础存活分
         
-        # 撞墙/原地不动惩罚：抵消生存分，逼迫其绕开障碍物
-        if is_stuck:
-            reward -= 0.1 
-
-        # 【吃宝箱】：加入了"安全锁"逻辑
-        cur_treasure = hero.get("treasure_collected_count", 0)
-        if cur_treasure > self.last_treasure_count:
-            reward += 1.5  
-            self.last_treasure_count = cur_treasure
-        else:
-            # 只有在怪物距离较远（安全）时，才允许产生宝箱引力
-            if nearest_t_dist != MAP_SIZE * 1.41 and nearest_m_dist > 5.0:
-                reward += 0.02 * (1.0 / (nearest_t_dist / 10.0 + 1.0))
-                if nearest_t_dist < self.last_nearest_t_dist: 
-                    reward += 0.01
-
-        # 【吃加速】：适配新的怪物加速时间（300步）
+        # 【猛药1：十步防蹲坑】
+        if len(self.pos_history) == 11:
+            p_list = list(self.pos_history)
+            xs = [p[0] for p in p_list]
+            zs = [p[1] for p in p_list]
+            # 如果过去10步的活动范围小于 2x2（在原地打转或卡墙），给予毁灭性惩罚
+            if max(xs) - min(xs) <= 2.0 and max(zs) - min(zs) <= 2.0:
+                reward -= 1.0
+                
+        # 【猛药2：加速Buff最高优先级】
         cur_buff_time = hero.get("buff_remaining_time", 0)
         if cur_buff_time > 0 and self.last_buff_time == 0: 
-            reward += 1.0  
-        elif cur_buff_time == 0 and self.step_no > 200:
-            # 【修改点】由于怪物300步就加速，所以这里改为200步后就要开始强制寻找Buff
-            if nearest_b_dist != MAP_SIZE * 1.41 and nearest_m_dist > 4.0:
-                reward += 0.03 * (1.0 / (nearest_b_dist / 10.0 + 1.0))
+            reward += 10.0  # 重赏！吃Buff是活下去的唯一希望
+        elif cur_buff_time == 0:
+            # “面包屑”引诱：只要没Buff，每靠近Buff一步就给分
+            if nearest_b_dist != MAP_SIZE * 1.41:
                 if nearest_b_dist < self.last_nearest_b_dist:
-                    reward += 0.015
-        
-        # 【交闪现】：极限救场 vs 乱交技能
+                    reward += 0.05
+                    
+        # 【猛药3：安全贪婪吃宝箱】
+        cur_treasure = hero.get("treasure_collected_count", 0)
+        if cur_treasure > self.last_treasure_count:
+            reward += 5.0
+            self.last_treasure_count = cur_treasure
+        else:
+            # 只有当怪物距离远于5格时，才用面包屑引诱它去吃宝箱（绝对不硬吃）
+            if nearest_m_dist > 5.0 and nearest_t_dist != MAP_SIZE * 1.41:
+                if nearest_t_dist < self.last_nearest_t_dist: 
+                    reward += 0.03
+
+        # 【怪物与闪现管理】
+        if nearest_m_dist < 4.0:
+            # 距离越近，扣分越狠 (线性斜坡惩罚)
+            reward -= 0.4 * (4.0 - nearest_m_dist)
+            
+        # 贴脸必死极度惩罚
+        if nearest_m_dist <= 1.5:
+            reward -= 2.0
+
+        # 交闪现判定
         if flash_cd > self.last_flash_cd: 
-            if nearest_m_dist < 6.0:
-                reward += 0.5  
+            if nearest_m_dist < 4.5:
+                reward += 2.0  # 极限逃生，好评！
             else:
-                reward -= 0.2  
+                reward -= 1.0  # 乱交技能，重罚！
 
-        # 怪物极度恐惧惩罚
-        if nearest_m_dist <= 2.0:
-            reward -= 1.5  
-        elif nearest_m_dist < 6.0:
-            reward -= 0.2 * (1.0 / (nearest_m_dist + 0.1))
-
-        # 【防背刺】：适配新的怪物2出生时间（200步）
-        # 【修改点】第200步在10步前的位置生成怪物，所以在185~215步期间强行逼迫其离开10步前的位置
+        # 【防背刺】: 第200步左右避开10步前的位置
         if 185 < self.step_no < 215 and len(self.pos_history) == 11:
             dist_to_h10 = np.sqrt((hx-self.pos_history[0][0])**2 + (hz-self.pos_history[0][1])**2)
             if dist_to_h10 < 6.0: 
